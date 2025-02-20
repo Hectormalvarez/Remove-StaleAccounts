@@ -53,24 +53,31 @@ function Remove-StaleAccounts {
     )
     
     Begin {
-        # active directory module check
         try {            
+            Import-Module ActiveDirectory
             if (-not (Get-Module -Name ActiveDirectory)) {
                 Write-Error "The Active Directory module is required. Please import it and try again."
                 return
-            } else {
-                Write-Verbose "Active Directory module found!"
             }
-            # initialize pssession for use during script
-            # script will fail if unable to initiate a pssession
-            $RemoteSession = new-pssession -ComputerName $ComputerName -ErrorAction Stop
+            
+            # Verify computer exists in AD first
+            $adComputer = Get-ADComputer -Identity $ComputerName -ErrorAction Stop
+            if (-not $adComputer) {
+                throw "Computer not found in Active Directory"
+            }
+
+            # Test connection before creating session
+            if (-not (Test-Connection -ComputerName $ComputerName -Quiet -Count 1)) {
+                throw "Cannot connect to $ComputerName"
+            }
+
+            $RemoteSession = New-PSSession -ComputerName $ComputerName -ErrorAction Stop
         }
         catch {
-            Write-Error "Initialization failed please check error messages and try again"
+            Write-Error "Initialization failed: $_"
             throw
         }
 
-        # setup output structure
         $Output = [pscustomobject]@{
             LocalUserFolders        = @() 
             ADUserResults           = @()
@@ -78,11 +85,11 @@ function Remove-StaleAccounts {
             UsersInDeprovisioningOU = @()
             UsersAtDifferentStore   = @() 
             WorkstationADObject     = $null
+            UsersToRemove           = @()
         }
 
-        # gets remote computer AD object, used to check if user is at same store
-        $Output.WorkstationADObject = Get-ADComputer -Filter { Name -like $ComputerName }
-        # defines get-localusersfolders function in remote session
+        $Output.WorkstationADObject = $adComputer
+
         Invoke-Command -Session $RemoteSession -ScriptBlock {
             function Get-LocalUserFolders {
                 <#
@@ -102,77 +109,71 @@ function Remove-StaleAccounts {
                    'systemprofile'
                 )
                  
-                $Folders = @()
-                 
-                Get-ChildItem "C:\Users" -Directory |
-                Where-Object { $_.Name -notin $SystemAccounts } |
-                ForEach-Object {
-                   $Folders += $_
-                }
-                 
-                Write-Output $Folders
+                Get-ChildItem "C:\Users" -Directory | 
+                Where-Object { $_.Name -notin $SystemAccounts } | 
+                Select-Object Name, FullName, LastWriteTime
             }
         }
-            }
+    }
     
     Process {
-        # collects list of folder names within c:\users
-        $Output.LocalUserFolders = Invoke-Command -Session $RemoteSession -ScriptBlock { Get-LocalUserFolders } -ErrorAction Stop
+        try {
+            $Output.LocalUserFolders = Invoke-Command -Session $RemoteSession -ScriptBlock { 
+                Get-LocalUserFolders 
+            }
 
+            if ($Output.LocalUserFolders.Count -gt 0) {
+                $Filter = $($Output.LocalUserFolders | ForEach-Object { "SamAccountName -eq '$($_.Name)'" }) -join " -or "
+                $Output.ADUserResults = Get-ADUser -Filter $Filter -Properties DisplayName, DistinguishedName
 
-        # Create a filter string to find active users not in the $Output.LocalUserFolders list
-        # building this filter allows for one call to AD vs one for each user
-        $Filter = $($Output.LocalUserFolders | ForEach-Object { "SamAccountName -eq '$($_.Name)'" }) -join " -or "
-        # save users found in Active Directory to output
-        $Output.ADUserResults = Get-ADUser -Filter $Filter -Properties DisplayName
-        
+                # Get usernames not found in AD
+                $UsersNames = $Output.ADUserResults | Select-Object -ExpandProperty SamAccountName
+                $FolderNames = $Output.LocalUserFolders | Select-Object -ExpandProperty Name
+                $Output.UsersNotInAD = Compare-Object -ReferenceObject $FolderNames -DifferenceObject $UsersNames -IncludeEqual |
+                    Where-Object SideIndicator -eq '<=' |
+                    Select-Object -ExpandProperty InputObject
 
-        # extracts SamAccountNames from ADUserResults
-        $UsersNames = $Output.ADUserResults |
-        Select-Object -ExpandProperty SamAccountName
-        $FolderNames = $Output.LocalUserFolders |
-        Select-Object -ExpandProperty Name
-        # compares LocalUserFolders and usersNames variables to get
-        # list of folders of users that are not in active directory
-        # Filter to only get items from LocalUserFolders not in usersNames
-        # (indicated by <= in SideIndicator)
-        $Output.UsersNotInAD = Compare-Object -ReferenceObject $FolderNames -DifferenceObject $UsersNames -IncludeEqual |
-        Where-Object SideIndicator -eq '<=' |
-        Select-Object -ExpandProperty InputObject
-
-
-        $WorkstationStore = $Output.WorkstationADObject.DistinguishedName.Split(",")[2] # 3 alpha 
-        foreach ($user in $Output.ADUserResults) {
-            # gets 3rd block from fqdn which is usually the store block
-            # will be used to compare to workstation store ou
-            $UserStore = $user.distinguishedname.Split(",")[2]
-            switch ($UserStore) {
-                # if user store code = store code continue to next user
-                $WorkstationStore { break }
-                # if store code matches region user is in wrong OU (not in a store OU)
-                # need to extract TM store location from display name: first last (RR SSS) R=region, S=store
-                # find users in deprovisioning OU
-                "OU=DEPROVISIONING" { $Output.UsersInDeprovisioningOU += $user; break }
-                Default {
-                    if ($user.DisplayName -match "\((.+?)\)") {
-                        $values = $matches[1] -split " "
-                        $storeCode = $values[1]
-                        if ($storeCode -eq $UserStore) { break }
-                        else {
-                            $Output.UsersAtDifferentStore += $user
+                if ($Output.WorkstationADObject.DistinguishedName) {
+                    $WorkstationStore = $Output.WorkstationADObject.DistinguishedName.Split(",")[2]
+                    
+                    foreach ($user in $Output.ADUserResults) {
+                        $UserStore = $user.DistinguishedName.Split(",")[2]
+                        switch ($UserStore) {
+                            $WorkstationStore { break }
+                            "OU=DEPROVISIONING" { 
+                                $Output.UsersInDeprovisioningOU += $user
+                                break 
+                            }
+                            Default {
+                                if ($user.DisplayName -match "\((.+?)\)") {
+                                    $values = $matches[1] -split " "
+                                    $storeCode = $values[1]
+                                    if ($storeCode -ne $UserStore) {
+                                        $Output.UsersAtDifferentStore += $user
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+
+                # Combine all users that need to be removed
+                $Output.UsersToRemove = @($Output.UsersNotInAD) + 
+                                      ($Output.UsersAtDifferentStore | Select-Object -ExpandProperty SamAccountName) +
+                                      ($Output.UsersInDeprovisioningOU | Select-Object -ExpandProperty SamAccountName) |
+                                      Select-Object -Unique
             }
+        }
+        catch {
+            Write-Error "Process block error: $_"
         }
         
         Write-Output $Output
     }
     
     End {
-        # cleanup remote session
-        Remove-PSSession $RemoteSession
+        if ($RemoteSession) {
+            Remove-PSSession $RemoteSession
+        }
     } 
 }
-
-     
